@@ -12,12 +12,20 @@ app.use(express.json());
 let fcmReady = false;
 try {
   let credential;
+
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     credential = admin.credential.cert(
       JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
     );
-  } else {
+  } else if (fs.existsSync("/etc/secrets/firebase-service-account.json")) {
+    const sa = JSON.parse(
+      fs.readFileSync("/etc/secrets/firebase-service-account.json", "utf8")
+    );
+    credential = admin.credential.cert(sa);
+  } else if (fs.existsSync(path.join(__dirname, "service-account.json"))) {
     credential = admin.credential.cert(require("./service-account.json"));
+  } else {
+    throw new Error("No Firebase credentials found");
   }
 
   if (!admin.apps.length) {
@@ -101,16 +109,15 @@ app.post("/api/orders", async (req, res) => {
     if (fcmReady) {
       const tokens = readTokens();
       if (tokens.length > 0) {
-        const message = {
-          notification: {
-            title: "New Order — Swaddhist",
-            body: (order.name || "Customer") + " · " + order.id
-          },
-          data: { orderId: String(order.id) },
-          tokens: tokens
-        };
         try {
-          const result = await admin.messaging().sendEachForMulticast(message);
+          const result = await admin.messaging().sendEachForMulticast({
+            notification: {
+              title: "New Order — Swaddhist",
+              body: (order.name || "Customer") + " · " + order.id
+            },
+            data: { orderId: String(order.id) },
+            tokens: tokens
+          });
           console.log(
             "FCM:",
             result.successCount,

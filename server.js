@@ -10,22 +10,31 @@ app.use(express.json());
 
 // ---------- Firebase Admin (FCM) ----------
 let fcmReady = false;
-try {
-  let credential;
+let fcmError = "";
 
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    credential = admin.credential.cert(
-      JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-    );
-  } else if (fs.existsSync("/etc/secrets/firebase-service-account.json")) {
+try {
+  let credential = null;
+
+  // 1) Secret File (Render) — preferred
+  if (fs.existsSync("/etc/secrets/firebase-service-account.json")) {
     const sa = JSON.parse(
       fs.readFileSync("/etc/secrets/firebase-service-account.json", "utf8")
     );
     credential = admin.credential.cert(sa);
-  } else if (fs.existsSync(path.join(__dirname, "service-account.json"))) {
+  }
+  // 2) Env var (only if Secret File not present)
+  else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    credential = admin.credential.cert(
+      JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+    );
+  }
+  // 3) Local file (PC testing)
+  else if (fs.existsSync(path.join(__dirname, "service-account.json"))) {
     credential = admin.credential.cert(require("./service-account.json"));
   } else {
-    throw new Error("No Firebase credentials found");
+    throw new Error(
+      "No credentials. Add Secret File firebase-service-account.json on Render"
+    );
   }
 
   if (!admin.apps.length) {
@@ -34,7 +43,8 @@ try {
   fcmReady = true;
   console.log("Firebase Admin ready");
 } catch (err) {
-  console.error("Firebase Admin failed:", err.message);
+  fcmError = err.message || String(err);
+  console.error("Firebase Admin failed:", fcmError);
   fcmReady = false;
 }
 
@@ -70,13 +80,13 @@ function writeTokens(tokens) {
   fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
 }
 
-// Health
+// Health — error reason bhi dikhega
 app.get("/", (req, res) => {
-  res.send(
-    fcmReady
-      ? "Swaddhist Backend + FCM running"
-      : "Swaddhist Backend running (FCM not ready)"
-  );
+  if (fcmReady) {
+    res.send("Swaddhist Backend + FCM running");
+  } else {
+    res.send("Swaddhist Backend running (FCM not ready): " + fcmError);
+  }
 });
 
 // Save admin device token

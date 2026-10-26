@@ -2,7 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
-const admin = require("firebase-admin");
+const { initializeApp, cert, getApps } = require("firebase-admin/app");
+const { getMessaging } = require("firebase-admin/messaging");
 
 const app = express();
 app.use(cors());
@@ -11,35 +12,36 @@ app.use(express.json());
 // ---------- Firebase Admin (FCM) ----------
 let fcmReady = false;
 let fcmError = "";
+let messaging = null;
 
 try {
-  let credential = null;
+  let serviceAccount = null;
 
-  // 1) Secret File (Render) — preferred
   if (fs.existsSync("/etc/secrets/firebase-service-account.json")) {
-    const sa = JSON.parse(
+    serviceAccount = JSON.parse(
       fs.readFileSync("/etc/secrets/firebase-service-account.json", "utf8")
     );
-    credential = admin.credential.cert(sa);
-  }
-  // 2) Env var (only if Secret File not present)
-  else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    credential = admin.credential.cert(
-      JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-    );
-  }
-  // 3) Local file (PC testing)
-  else if (fs.existsSync(path.join(__dirname, "service-account.json"))) {
-    credential = admin.credential.cert(require("./service-account.json"));
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  } else if (fs.existsSync(path.join(__dirname, "service-account.json"))) {
+    serviceAccount = require("./service-account.json");
   } else {
     throw new Error(
       "No credentials. Add Secret File firebase-service-account.json on Render"
     );
   }
 
-  if (!admin.apps.length) {
-    admin.initializeApp({ credential });
+  if (!serviceAccount.project_id || !serviceAccount.private_key) {
+    throw new Error("Invalid service account JSON (missing project_id or private_key)");
   }
+
+  if (!getApps().length) {
+    initializeApp({
+      credential: cert(serviceAccount)
+    });
+  }
+
+  messaging = getMessaging();
   fcmReady = true;
   console.log("Firebase Admin ready");
 } catch (err) {
@@ -80,7 +82,7 @@ function writeTokens(tokens) {
   fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
 }
 
-// Health — error reason bhi dikhega
+// Health
 app.get("/", (req, res) => {
   if (fcmReady) {
     res.send("Swaddhist Backend + FCM running");
@@ -116,11 +118,11 @@ app.post("/api/orders", async (req, res) => {
     orders.unshift(order);
     writeOrders(orders);
 
-    if (fcmReady) {
+    if (fcmReady && messaging) {
       const tokens = readTokens();
       if (tokens.length > 0) {
         try {
-          const result = await admin.messaging().sendEachForMulticast({
+          const result = await messaging.sendEachForMulticast({
             notification: {
               title: "New Order — Swaddhist",
               body: (order.name || "Customer") + " · " + order.id

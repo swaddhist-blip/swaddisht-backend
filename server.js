@@ -9,14 +9,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------- Firebase Admin (FCM) ----------
 let fcmReady = false;
 let fcmError = "";
 let messaging = null;
 
 try {
   let serviceAccount = null;
-
   if (fs.existsSync("/etc/secrets/firebase-service-account.json")) {
     serviceAccount = JSON.parse(
       fs.readFileSync("/etc/secrets/firebase-service-account.json", "utf8")
@@ -26,32 +24,22 @@ try {
   } else if (fs.existsSync(path.join(__dirname, "service-account.json"))) {
     serviceAccount = require("./service-account.json");
   } else {
-    throw new Error(
-      "No credentials. Add Secret File firebase-service-account.json on Render"
-    );
-  }
-
-  if (!serviceAccount.project_id || !serviceAccount.private_key) {
-    throw new Error("Invalid service account JSON (missing project_id or private_key)");
+    throw new Error("No Firebase credentials");
   }
 
   if (!getApps().length) {
-    initializeApp({
-      credential: cert(serviceAccount)
-    });
+    initializeApp({ credential: cert(serviceAccount) });
   }
-
   messaging = getMessaging();
   fcmReady = true;
   console.log("Firebase Admin ready");
 } catch (err) {
   fcmError = err.message || String(err);
   console.error("Firebase Admin failed:", fcmError);
-  fcmReady = false;
 }
 
-// ---------- Orders ----------
 const ORDERS_FILE = path.join(__dirname, "orders.json");
+const TOKENS_FILE = path.join(__dirname, "tokens.json");
 
 function readOrders() {
   try {
@@ -61,14 +49,9 @@ function readOrders() {
     return [];
   }
 }
-
 function writeOrders(orders) {
   fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2));
 }
-
-// ---------- FCM tokens ----------
-const TOKENS_FILE = path.join(__dirname, "tokens.json");
-
 function readTokens() {
   try {
     if (!fs.existsSync(TOKENS_FILE)) return [];
@@ -77,34 +60,31 @@ function readTokens() {
     return [];
   }
 }
-
 function writeTokens(tokens) {
   fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
 }
 
-// Health
 app.get("/", (req, res) => {
-  if (fcmReady) {
-    res.send("Swaddhist Backend + FCM running");
-  } else {
-    res.send("Swaddhist Backend running (FCM not ready): " + fcmError);
-  }
+  res.send(
+    fcmReady
+      ? "Swaddhist Backend + FCM running"
+      : "Swaddhist Backend running (FCM not ready): " + fcmError
+  );
 });
 
-// Save admin device token
 app.post("/api/token", (req, res) => {
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ error: "token required" });
-
-  let tokens = readTokens();
-  if (!tokens.includes(token)) {
-    tokens.push(token);
-    writeTokens(tokens);
-  }
+  let tokens = readTokens().filter((t) => t && t !== "test-debug-token");
+  if (!tokens.includes(token)) tokens.push(token);
+  writeTokens(tokens);
   res.json({ ok: true, count: tokens.length });
 });
 
-// Create order + notify
+app.get("/api/token-count", (req, res) => {
+  res.json({ count: readTokens().filter((t) => t !== "test-debug-token").length, fcmReady });
+});
+
 app.post("/api/orders", async (req, res) => {
   try {
     const order = {
@@ -113,60 +93,73 @@ app.post("/api/orders", async (req, res) => {
       status: "Pending",
       createdAt: new Date().toISOString()
     };
-
     const orders = readOrders();
     orders.unshift(order);
     writeOrders(orders);
 
+    let fcm = { sent: 0, fail: 0, tokens: 0 };
+
     if (fcmReady && messaging) {
-      const tokens = readTokens();
+      let tokens = readTokens().filter((t) => t && t !== "test-debug-token");
+      fcm.tokens = tokens.length;
+
       if (tokens.length > 0) {
         try {
           const result = await messaging.sendEachForMulticast({
             notification: {
               title: "New Order — Swaddhist",
-              body: (order.name || "Customer") + " · " + order.id
+              body: (order.name || "Customer") + " · " + order.id,
+              icon: "https://swaddhist.vercel.app/logo.png"
+            },
+            webpush: {
+              notification: {
+                icon: "https://swaddhist.vercel.app/logo.png",
+                badge: "https://swaddhist.vercel.app/logo.png"
+              },
+              fcmOptions: {
+                link: "https://swaddhist.vercel.app/admin/orders.html"
+              }
             },
             data: { orderId: String(order.id) },
-            tokens: tokens
+            tokens
           });
-          console.log(
-            "FCM:",
-            result.successCount,
-            "ok,",
-            result.failureCount,
-            "fail"
-          );
+
+          fcm.sent = result.successCount;
+          fcm.fail = result.failureCount;
+
+          // invalid tokens hatao
+          const keep = [];
+          result.responses.forEach((r, i) => {
+            if (r.success) keep.push(tokens[i]);
+            else console.log("FCM fail:", r.error && r.error.code, r.error && r.error.message);
+          });
+          writeTokens(keep);
         } catch (e) {
-          console.error("FCM send error:", e.message);
+          console.error("FCM error:", e.message);
+          fcm.error = e.message;
         }
       }
     }
 
-    res.json({ ok: true, order });
+    res.json({ ok: true, order, fcm });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not save order" });
   }
 });
 
-// All orders
 app.get("/api/orders", (req, res) => {
   res.json(readOrders());
 });
 
-// Update status
 app.patch("/api/orders/:id", (req, res) => {
   const orders = readOrders();
   const i = orders.findIndex((o) => o.id === req.params.id);
   if (i === -1) return res.status(404).json({ error: "not found" });
-
   if (req.body.status) orders[i].status = req.body.status;
   writeOrders(orders);
   res.json({ ok: true, order: orders[i] });
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log("Server on port", PORT);
-});
+app.listen(PORT, () => console.log("Server on port", PORT));

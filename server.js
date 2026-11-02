@@ -17,39 +17,81 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const PORT = process.env.PORT || 5000;
+const EXPECTED_PROJECT_ID = "swaddhist-3f3db";
+
 let fcmReady = false;
 let fcmError = "";
 let messaging = null;
+
+// ==================================
+// FILE PATHS
+// ==================================
+
+const ORDERS_FILE = path.join(__dirname, "orders.json");
+const TOKENS_FILE = path.join(__dirname, "tokens.json");
+
+const SECRET_PATH = "/etc/secrets/firebase-service-account.json";
+const LOCAL_SECRET_PATH = path.join(
+  __dirname,
+  "firebase-service-account.json"
+);
+
+// ==================================
+// JSON HELPERS
+// ==================================
+
+function readJSON(file, fallback = []) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    console.error("JSON Read Error:", error.message);
+    return fallback;
+  }
+}
+
+function writeJSON(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function readOrders() {
+  return readJSON(ORDERS_FILE, []);
+}
+
+function readTokens() {
+  const data = readJSON(TOKENS_FILE, []);
+  return Array.isArray(data) ? data : [];
+}
 
 // ==================================
 // FIREBASE ADMIN INITIALIZATION
 // ==================================
 
 try {
-  let serviceAccount = null;
+  let serviceAccount;
 
-  const secretPath = "/etc/secrets/firebase-service-account.json";
-  const localPath = path.join(__dirname, "firebase-service-account.json");
-  const oldLocalPath = path.join(__dirname, "service-account.json");
-
-  if (fs.existsSync(secretPath)) {
+  if (fs.existsSync(SECRET_PATH)) {
     serviceAccount = JSON.parse(
-      fs.readFileSync(secretPath, "utf8")
+      fs.readFileSync(SECRET_PATH, "utf8")
     );
   } else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     serviceAccount = JSON.parse(
       process.env.FIREBASE_SERVICE_ACCOUNT
     );
-  } else if (fs.existsSync(localPath)) {
+  } else if (fs.existsSync(LOCAL_SECRET_PATH)) {
     serviceAccount = JSON.parse(
-      fs.readFileSync(localPath, "utf8")
-    );
-  } else if (fs.existsSync(oldLocalPath)) {
-    serviceAccount = JSON.parse(
-      fs.readFileSync(oldLocalPath, "utf8")
+      fs.readFileSync(LOCAL_SECRET_PATH, "utf8")
     );
   } else {
     throw new Error("Firebase service account file not found");
+  }
+
+  if (serviceAccount.project_id !== EXPECTED_PROJECT_ID) {
+    throw new Error(
+      "Wrong Firebase Project ID: " + serviceAccount.project_id
+    );
   }
 
   if (!getApps().length) {
@@ -62,51 +104,11 @@ try {
   fcmReady = true;
 
   console.log("Firebase Admin Ready!");
+  console.log("Firebase Project:", EXPECTED_PROJECT_ID);
 
-} catch (err) {
-  fcmError = err.message || String(err);
+} catch (error) {
+  fcmError = error.message;
   console.error("Firebase Admin Error:", fcmError);
-}
-
-// ==================================
-// FILE PATHS
-// ==================================
-
-const ORDERS_FILE = path.join(__dirname, "orders.json");
-const TOKENS_FILE = path.join(__dirname, "tokens.json");
-
-// ==================================
-// JSON HELPERS
-// ==================================
-
-function readJSON(file, fallback = []) {
-  try {
-    if (!fs.existsSync(file)) return fallback;
-
-    const data = JSON.parse(
-      fs.readFileSync(file, "utf8")
-    );
-
-    return data;
-  } catch (err) {
-    console.error("File read error:", file, err.message);
-    return fallback;
-  }
-}
-
-function writeJSON(file, data) {
-  fs.writeFileSync(
-    file,
-    JSON.stringify(data, null, 2)
-  );
-}
-
-function readOrders() {
-  return readJSON(ORDERS_FILE, []);
-}
-
-function readTokens() {
-  return readJSON(TOKENS_FILE, []);
 }
 
 // ==================================
@@ -116,37 +118,43 @@ function readTokens() {
 app.get("/", (req, res) => {
   res.json({
     message: "Swaddhist Backend Running",
+    projectId: EXPECTED_PROJECT_ID,
     fcmReady,
     fcmError: fcmReady ? null : fcmError
   });
 });
 
 // ==================================
-// SAVE ADMIN FCM TOKEN
+// REGISTER ADMIN DEVICE TOKEN
 // ==================================
 
 app.post("/api/token", (req, res) => {
   try {
     const { token } = req.body || {};
 
-    if (!token) {
+    if (!token || typeof token !== "string") {
       return res.status(400).json({
         ok: false,
-        error: "Token required"
+        error: "Valid FCM token required"
       });
     }
 
     let tokens = readTokens();
 
-    tokens = tokens.filter(
-      t => t && t !== "test-debug-token"
-    );
+    // Remove empty and duplicate tokens
+    tokens = [...new Set(tokens.filter(
+      t => typeof t === "string" && t.trim() !== ""
+    ))];
 
+    // Save new token without deleting other devices
     if (!tokens.includes(token)) {
       tokens.push(token);
     }
 
     writeJSON(TOKENS_FILE, tokens);
+
+    console.log("Admin FCM Token Registered");
+    console.log("Total Tokens:", tokens.length);
 
     res.json({
       ok: true,
@@ -154,8 +162,8 @@ app.post("/api/token", (req, res) => {
       count: tokens.length
     });
 
-  } catch (err) {
-    console.error("Token save error:", err);
+  } catch (error) {
+    console.error("Token Save Error:", error.message);
 
     res.status(500).json({
       ok: false,
@@ -169,7 +177,7 @@ app.post("/api/token", (req, res) => {
 // ==================================
 
 app.get("/api/token-count", (req, res) => {
-  const tokens = readTokens().filter(Boolean);
+  const tokens = readTokens();
 
   res.json({
     count: tokens.length,
@@ -178,101 +186,117 @@ app.get("/api/token-count", (req, res) => {
 });
 
 // ==================================
-// SEND NEW ORDER NOTIFICATION
+// SEND ORDER NOTIFICATION
 // ==================================
 
 async function sendOrderNotification(order) {
   const fcm = {
     sent: 0,
     fail: 0,
-    tokens: 0
+    tokens: 0,
+    errors: []
   };
 
   if (!fcmReady || !messaging) {
-    fcm.error = "Firebase is not ready";
+    fcm.error = fcmError || "Firebase is not ready";
     return fcm;
   }
 
-  const tokens = readTokens().filter(
-    t => t && t !== "test-debug-token"
-  );
+  let tokens = [...new Set(readTokens().filter(Boolean))];
 
   fcm.tokens = tokens.length;
 
-  if (!tokens.length) {
-    fcm.error = "No admin device token registered";
+  if (tokens.length === 0) {
+    fcm.error = "No admin device registered";
     return fcm;
   }
 
-  try {
-    const result = await messaging.sendEachForMulticast({
-      tokens,
+  // Firebase multicast limit is 500 tokens per request
+  const validTokens = [];
 
-      notification: {
-        title: "New Order - Swaddhist",
-        body: `${order.name || "Customer"} placed a new order. Order ID: ${order.id}`
-      },
+  for (let start = 0; start < tokens.length; start += 500) {
+    const batch = tokens.slice(start, start + 500);
 
-      data: {
-        orderId: String(order.id),
-        type: "NEW_ORDER"
-      },
+    try {
+      const result = await messaging.sendEachForMulticast({
+        tokens: batch,
 
-      webpush: {
         notification: {
           title: "New Order - Swaddhist",
-          body: `${order.name || "Customer"} placed a new order`,
-          icon: "https://swaddhist.vercel.app/logo.png",
-          badge: "https://swaddhist.vercel.app/logo.png",
-          tag: String(order.id),
-          requireInteraction: true
+          body: `${order.name || "Customer"} placed a new order. Order ID: ${order.id}`
         },
 
-        fcmOptions: {
-          link: "https://swaddhist.vercel.app/admin/orders.html"
+        data: {
+          orderId: String(order.id),
+          type: "NEW_ORDER"
+        },
+
+        webpush: {
+          notification: {
+            title: "New Order - Swaddhist",
+            body: `${order.name || "Customer"} placed a new order`,
+            icon: "https://swaddhist.vercel.app/logo.png",
+            badge: "https://swaddhist.vercel.app/logo.png",
+            tag: String(order.id),
+            requireInteraction: true
+          },
+
+          fcmOptions: {
+            link: "https://swaddhist.vercel.app/admin/orders.html"
+          }
         }
-      }
-    });
+      });
 
-    fcm.sent = result.successCount;
-    fcm.fail = result.failureCount;
+      fcm.sent += result.successCount;
+      fcm.fail += result.failureCount;
 
-    const validTokens = [];
+      result.responses.forEach((response, index) => {
+        const currentToken = batch[index];
 
-    result.responses.forEach((response, index) => {
-      if (response.success) {
-        validTokens.push(tokens[index]);
-      } else {
-        const error = response.error;
+        if (response.success) {
+          validTokens.push(currentToken);
+        } else {
+          const code = response.error?.code || "unknown";
+          const message = response.error?.message || "Unknown error";
 
-        console.log(
-          "FCM Error:",
-          error?.code,
-          error?.message
-        );
+          console.error("FCM Error:", code, message);
 
-        // Keep tokens unless they are permanently invalid.
-        if (
-          error?.code !== "messaging/registration-token-not-registered" &&
-          error?.code !== "messaging/invalid-registration-token"
-        ) {
-          validTokens.push(tokens[index]);
+          fcm.errors.push({
+            code,
+            message
+          });
+
+          // Remove tokens which cannot work with this Firebase project
+          const permanentErrors = [
+            "messaging/registration-token-not-registered",
+            "messaging/invalid-registration-token",
+            "messaging/mismatched-credential"
+          ];
+
+          if (!permanentErrors.includes(code)) {
+            validTokens.push(currentToken);
+          }
         }
-      }
-    });
+      });
 
-    writeJSON(TOKENS_FILE, validTokens);
+    } catch (error) {
+      console.error("FCM Batch Error:", error.message);
 
-  } catch (err) {
-    console.error("Notification error:", err.message);
-    fcm.error = err.message;
+      fcm.error = error.message;
+
+      // Keep tokens if the whole batch request fails
+      validTokens.push(...batch);
+    }
   }
+
+  // Save only tokens that remain usable
+  writeJSON(TOKENS_FILE, validTokens);
 
   return fcm;
 }
 
 // ==================================
-// NEW ORDER API
+// CREATE NEW ORDER
 // ==================================
 
 app.post("/api/orders", async (req, res) => {
@@ -301,8 +325,8 @@ app.post("/api/orders", async (req, res) => {
       fcm
     });
 
-  } catch (err) {
-    console.error("Order error:", err);
+  } catch (error) {
+    console.error("Order Error:", error);
 
     res.status(500).json({
       ok: false,
@@ -333,6 +357,7 @@ app.patch("/api/orders/:id", (req, res) => {
 
     if (index === -1) {
       return res.status(404).json({
+        ok: false,
         error: "Order not found"
       });
     }
@@ -348,10 +373,11 @@ app.patch("/api/orders/:id", (req, res) => {
       order: orders[index]
     });
 
-  } catch (err) {
-    console.error(err);
+  } catch (error) {
+    console.error("Status Update Error:", error.message);
 
     res.status(500).json({
+      ok: false,
       error: "Status update failed"
     });
   }
@@ -360,8 +386,6 @@ app.patch("/api/orders/:id", (req, res) => {
 // ==================================
 // START SERVER
 // ==================================
-
-const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
   console.log("--------------------------------");
